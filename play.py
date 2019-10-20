@@ -3,6 +3,7 @@ import pygame
 import sys
 import time
 import matplotlib
+import rltorch.memory as M
 try:
     matplotlib.use('GTK3Agg')
     import matplotlib.pyplot as plt
@@ -17,7 +18,7 @@ from pygame.locals import HWSURFACE, DOUBLEBUF, RESIZABLE, VIDEORESIZE
 from threading import Thread, Event, Timer
 
 class Play:
-    def __init__(self, env, action_selector, memory, agent, transpose = True, fps = 30, zoom = None, keys_to_action = None):
+    def __init__(self, env, action_selector, memory, agent, sneaky_env, transpose = True, fps = 30, zoom = None, keys_to_action = None):
         self.env = env
         self.action_selector = action_selector
         self.transpose = transpose
@@ -34,7 +35,7 @@ class Play:
         self.paused = False
         self.memory = memory
         self.agent = agent
-        print("FPS ", 30)
+        self.sneaky_env = sneaky_env
     
     def _display_arr(self, obs, screen, arr, video_size):
         if obs is not None:
@@ -120,7 +121,7 @@ class Play:
         self.relevant_keys = set(sum(map(list, self.keys_to_action.keys()),[]))
     
     def _increment_state(self):
-        self.state = (self.state + 1) % 4
+        self.state = (self.state + 1) % 5
 
     def pause(self, text = ""):
         self.paused = True
@@ -144,6 +145,31 @@ class Play:
                 self.paused = False
         pygame.display.flip()
         self.clock.tick(self.fps)
+    
+
+    def sneaky_train(self):
+        # Backup memory
+        backup_memory = self.memory
+        self.memory = M.ReplayMemory(capacity = 2000) # Another configurable parameter
+        EPISODES = 30 # Make this configurable
+        replay_skip = 4 # Make this configurable
+        for _ in range(EPISODES):
+            prev_obs = self.sneaky_env.reset()
+            done = False
+            step = 0
+            while not done:
+                action = self.action_selector.act(prev_obs)
+                obs, reward, done, _ = self.sneaky_env.step(action)
+                self.memory.append(prev_obs, action, reward, obs, done)
+                prev_obs = obs
+                step += 1
+                if step % replay_skip == 0:
+                    self.agent.learn()
+        self.memory = backup_memory
+        # It would be cool instead of throwing away all this new data, we keep just a sample of it
+        # Not sure if i want all of it because then it'll drown out the expert demonstration data
+
+        
     
     def start(self):
         """Allows one to play the game using keyboard.
@@ -202,8 +228,12 @@ class Play:
         self.clock = pygame.time.Clock()
         
         # States
-        COMPUTER_PLAY = 0
-        HUMAN_PLAY = 2
+        HUMAN_PLAY = 0
+        SNEAKY_COMPUTER_PLAY = 1
+        TRANSITION = 2
+        COMPUTER_PLAY = 3
+        TRANSITION2 = 4
+        
 
         env_done = True
         prev_obs = None
@@ -214,28 +244,31 @@ class Play:
             if env_done:
                 obs = self.env.reset()
                 env_done = False
-            
-            if self.state == 0:
-                prev_obs, action, reward, obs, env_done = self._computer_play(obs)
-            elif self.state == 1:
-                self.pause("Your Turn! Press <Space> to Start")
-            elif self.state == 2:
+            if self.state is HUMAN_PLAY:
                 prev_obs, action, reward, obs, env_done = self._human_play(obs)
-            elif self.state == 3:
+            elif self.state is SNEAKY_COMPUTER_PLAY:
+                myfont = pygame.font.SysFont('Comic Sans MS', 50)
+                textsurface = myfont.render("Training....", False, (0, 0, 0))
+                self.screen.blit(textsurface,(0,0))
+                self.sneaky_train()
+                self._increment_state()
+            elif self.state is TRANSITION:
                 self.pause("Computers Turn! Press <Space> to Start")
+            elif self.state is COMPUTER_PLAY:
+                prev_obs, action, reward, obs, env_done = self._computer_play(obs)
+            elif self.state is TRANSITION2:
+                self.pause("Your Turn! Press <Space> to Start")
 
             if self.state is COMPUTER_PLAY or self.state is HUMAN_PLAY:
                 self.memory.append(prev_obs, action, reward, obs, env_done)
-                
-            if not self.paused:
                 i += 1
-                if i % (self.fps * 30) == 0: # Every 30 seconds...
-                    print("TRAINING...")
+                # Every 30 seconds...
+                if i % (self.fps * 30) == 0:
+                    print("Training...")
                     self.agent.learn()
                     print("PAUSING...")
                     self._increment_state()
                     i = 0
-
 
         pygame.quit()
 

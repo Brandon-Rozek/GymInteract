@@ -17,11 +17,9 @@ import argparse
 import sys
 import numpy as np
 
-
-## CURRRENT ISSUE: MaxSkipEnv applies to the human player as well, which makes for an awkward gaming experience
-# What are your thoughts? Training is different if expert isn't forced with the same constraint
-# At some point I need to introduce learning
-
+#
+## Networks
+#
 class Value(nn.Module):
   def __init__(self, state_size, action_size):
     super(Value, self).__init__()
@@ -69,16 +67,18 @@ class Value(nn.Module):
     return x
 
 
-
+#
+## Play Related Classes
+#
 Transition = namedtuple('Transition',
       ('state', 'action', 'reward', 'next_state', 'done'))
 
 class PlayClass(threading.Thread):
-  def __init__(self, env, action_selector, memory, agent, fps = 60):
+  def __init__(self, env, action_selector, memory, agent, sneaky_env, fps = 60):
     super(PlayClass, self).__init__()
     self.env = env
     self.fps = fps
-    self.play = play.Play(self.env, action_selector, memory, agent, fps = fps, zoom = 4)
+    self.play = play.Play(self.env, action_selector, memory, agent, sneaky_env, fps = fps, zoom = 4)
 
   def run(self):
     self.play.start()
@@ -162,19 +162,15 @@ if args['skip'] is None:
 if args['fps'] is None:
   args['fps'] = 30
 
-## Starting the game
-memory = []
-env = Record(gym.make(args['environment_name']), memory, args, skipframes = args['skip'])
-record_env = env
-env = gym.wrappers.Monitor(env, args['logdir'], force=True)
-env = E.ClippedRewardsWrapper(
+def wrap_preprocessing(env):
+  return E.ClippedRewardsWrapper(
     E.FrameStack(
       E.TorchWrap(
         E.ProcessFrame84(
           E.FireResetEnv(
             # E.MaxAndSkipEnv(
               E.NoopResetEnv(
-                E.EpisodicLifeEnv(gym.make(config['environment_name']))
+                E.EpisodicLifeEnv(env)
               , noop_max = 30)
             # , skip=4)
           )
@@ -182,6 +178,15 @@ env = E.ClippedRewardsWrapper(
       ),
     4)
   )
+
+## Starting the game
+memory = []
+env = Record(gym.make(args['environment_name']), memory, args, skipframes = args['skip'])
+record_env = env
+env = gym.wrappers.Monitor(env, args['logdir'], force=True)
+env = wrap_preprocessing(env)
+
+sneaky_env = wrap_preprocessing(gym.make(args['environment_name']))
 
 rltorch.set_seed(config['seed'])
 
@@ -199,7 +204,7 @@ agent = rltorch.agents.DQNAgent(net, memory, config, target_net = target_net)
 
 env.seed(config['seed'])
 
-playThread = PlayClass(env, actor, memory, agent, args['fps'])
+playThread = PlayClass(env, actor, memory, agent, sneaky_env, fps = args['fps'])
 playThread.start()
 
 ## Logging portion
