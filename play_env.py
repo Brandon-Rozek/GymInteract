@@ -1,21 +1,31 @@
-import play
-import rltorch
-import rltorch.memory as M
-import torch
-import gym
+
+# Import Python Standard Libraries
+from threading import Thread, Lock
+from argparse import ArgumentParser
 from collections import namedtuple
 from datetime import datetime
+
+# Import Pytorch related packages for NNs
+from numpy import array as np_array
+from numpy import save as np_save
+import torch
+from torch.optim import Adam
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Import my custom RL library
+import rltorch
+from rltorch.memory import PrioritizedReplayMemory
 from rltorch.action_selector import EpsilonGreedySelector
 import rltorch.env as E
 import rltorch.network as rn
-import torch.nn as nn
-import torch.nn.functional as F
-import pickle
-import threading
-from time import sleep
-import argparse
-import sys
-import numpy as np
+
+# Import OpenAI gym and related packages
+from gym import make as makeEnv
+from gym import Wrapper as GymWrapper
+from gym.wrappers import Monitor as GymMonitor
+import play
+
 
 #
 ## Networks
@@ -73,56 +83,56 @@ class Value(nn.Module):
 Transition = namedtuple('Transition',
       ('state', 'action', 'reward', 'next_state', 'done'))
 
-class PlayClass(threading.Thread):
-  def __init__(self, env, action_selector, memory, agent, sneaky_env, fps = 60):
+class PlayClass(Thread):
+  def __init__(self, env, action_selector, memory, memory_lock, agent, sneaky_env, config):
     super(PlayClass, self).__init__()
-    self.env = env
-    self.fps = fps
-    self.play = play.Play(self.env, action_selector, memory, agent, sneaky_env, fps = fps, zoom = 4)
+    self.play = play.Play(env, action_selector, memory, memory_lock, agent, sneaky_env, config)
 
   def run(self):
     self.play.start()
 
-class Record(gym.Wrapper):
-  def __init__(self, env, memory, args, skipframes = 3):
-    gym.Wrapper.__init__(self, env)
-    self.memory_lock = threading.Lock()
+class Record(GymWrapper):
+  def __init__(self, env, memory, memory_lock, args):
+    GymWrapper.__init__(self, env)
+    self.memory_lock = memory_lock
     self.memory = memory
-    self.args = args
-    self.skipframes = skipframes
-    self.current_i = skipframes
+    self.skipframes = args['skip']
+    self.environment_name = args['environment_name']
+    self.logdir = args['logdir']
+    self.current_i = 0
 
   def reset(self):
     return self.env.reset()
 
   def step(self, action):
-    self.memory_lock.acquire()
     state = self.env.env._get_obs()
     next_state, reward, done, info = self.env.step(action)
-    if self.current_i <= 0:
-      self.memory.append(Transition(state, action, reward, next_state, done))
-      self.current_i = self.skipframes
-    else: self.current_i -= 1
-    self.memory_lock.release()
+    self.current_i += 1
+    # Don't add to memory until a certain number of frames is reached
+    if self.current_i % self.skipframes == 0:
+      self.memory_lock.acquire()
+      self.memory.append(state, action, reward, next_state, done)
+      self.memory_lock.release()
+      self.current_i = 0
     return next_state, reward, done, info
   
   def log_transitions(self):
     self.memory_lock.acquire()
     if len(self.memory) > 0:
-      basename = self.args['logdir'] + "/{}.{}".format(self.args['environment_name'], datetime.now().strftime("%Y-%m-%d-%H-%M-%s"))
+      basename = self.logdir + "/{}.{}".format(self.environment_name, datetime.now().strftime("%Y-%m-%d-%H-%M-%s"))
       print("Base Filename: ", basename)
       state, action, reward, next_state, done = zip(*self.memory)
-      np.save(basename + "-state.npy", np.array(state), allow_pickle = False)
-      np.save(basename + "-action.npy", np.array(action), allow_pickle = False)
-      np.save(basename + "-reward.npy", np.array(reward), allow_pickle = False)
-      np.save(basename + "-nextstate.npy", np.array(next_state), allow_pickle = False)
-      np.save(basename + "-done.npy", np.array(done), allow_pickle = False)
+      np_save(basename + "-state.npy", np_array(state), allow_pickle = False)
+      np_save(basename + "-action.npy", np_array(action), allow_pickle = False)
+      np_save(basename + "-reward.npy", np_array(reward), allow_pickle = False)
+      np_save(basename + "-nextstate.npy", np_array(next_state), allow_pickle = False)
+      np_save(basename + "-done.npy", np_array(done), allow_pickle = False)
       self.memory.clear()
     self.memory_lock.release()
 
 
 ## Parsing arguments
-parser = argparse.ArgumentParser(description="Play and log the environment")
+parser = ArgumentParser(description="Play and log the environment")
 parser.add_argument("--environment_name", type=str, help="The environment name in OpenAI gym to play.")
 parser.add_argument("--logdir", type=str, help="Directory to log video and (state, action, reward, next_state, done) in.")
 parser.add_argument("--skip", type=int, help="Number of frames to skip logging.")
@@ -130,14 +140,20 @@ parser.add_argument("--fps", type=int, help="Number of frames per second")
 parser.add_argument("--model", type=str, help = "The path location of the PyTorch model")
 args = vars(parser.parse_args())
 
+## Main configuration for script
 config = {}
 config['seed'] = 901
+config['seconds_play_per_state'] = 60
+config['zoom'] = 4
 config['environment_name'] = 'PongNoFrameskip-v4'
 config['learning_rate'] = 1e-4
 config['target_sync_tau'] = 1e-3
 config['discount_rate'] = 0.99
 config['exploration_rate'] = rltorch.scheduler.ExponentialScheduler(initial_value = 1, end_value = 0.1, iterations = 10**5)
-config['batch_size'] = 480
+# Number of episodes for the computer to train the agent without the human seeing
+config['num_sneaky_episodes'] = 20
+config['replay_skip'] = 14
+config['batch_size'] = 32 * (config['replay_skip'] + 1)
 config['disable_cuda'] = False
 config['memory_size'] = 10**4
 # Prioritized vs Random Sampling
@@ -151,63 +167,73 @@ config['prioritized_replay_sampling_priority'] = 0.6
 config['prioritized_replay_weight_importance'] = rltorch.scheduler.ExponentialScheduler(initial_value = 0.4, end_value = 1, iterations = 10**5)
 
 
-
+# Environment name and log directory is vital so show help message and exit if not provided
 if args['environment_name'] is None or args['logdir'] is None:
   parser.print_help()
-  sys.exit(1)
+  exit(1)
 
+# Number of frames to skip when recording and fps can have sane defaults
 if args['skip'] is None:
   args['skip'] = 3
-
 if args['fps'] is None:
   args['fps'] = 30
 
-def wrap_preprocessing(env):
+
+def wrap_preprocessing(env, MaxAndSkipEnv = False):
+  env = E.NoopResetEnv(
+          E.EpisodicLifeEnv(env),
+          noop_max = 30
+        )
+  if MaxAndSkipEnv:
+    env = E.MaxAndSkipEnv(env, skip = 4)
   return E.ClippedRewardsWrapper(
     E.FrameStack(
       E.TorchWrap(
         E.ProcessFrame84(
-          E.FireResetEnv(
-            # E.MaxAndSkipEnv(
-              E.NoopResetEnv(
-                E.EpisodicLifeEnv(env)
-              , noop_max = 30)
-            # , skip=4)
-          )
+          E.FireResetEnv(env)
         )
-      ),
-    4)
+      )
+    , 4)
   )
 
-## Starting the game
-memory = []
-env = Record(gym.make(args['environment_name']), memory, args, skipframes = args['skip'])
+
+## Set up environment to be recorded and preprocessed
+memory = PrioritizedReplayMemory(capacity = config['memory_size'], alpha = config['prioritized_replay_sampling_priority'])
+memory_lock = Lock()
+env = Record(makeEnv(args['environment_name']), memory, memory_lock, args)
+# Bind record_env to current env so that we can reference log_transitions easier later
 record_env = env
-env = gym.wrappers.Monitor(env, args['logdir'], force=True)
+# Use native gym  monitor to get video recording
+env = GymMonitor(env, args['logdir'], force=True)
+# Preprocess enviornment
 env = wrap_preprocessing(env)
 
-sneaky_env = wrap_preprocessing(gym.make(args['environment_name']))
+# Use a different environment for when the computer trains on the side so that the current game state isn't manipuated
+# Also use MaxEnvSkip to speed up processing
+sneaky_env = wrap_preprocessing(makeEnv(args['environment_name']), MaxAndSkipEnv = True)
 
+# Set seeds
 rltorch.set_seed(config['seed'])
+env.seed(config['seed'])
 
 device = torch.device("cuda:0" if torch.cuda.is_available() and not config['disable_cuda'] else "cpu")
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
+# Set up the networks
 net = rn.Network(Value(state_size, action_size), 
-                      torch.optim.Adam, config, device = device)
+                      Adam, config, device = device)
 target_net = rn.TargetNetwork(net, device = device)
 
+# Relevant components from RLTorch
 actor = EpsilonGreedySelector(net, action_size, device = device, epsilon = config['exploration_rate'])
-memory = M.PrioritizedReplayMemory(capacity = config['memory_size'], alpha = config['prioritized_replay_sampling_priority'])
 agent = rltorch.agents.DQNAgent(net, memory, config, target_net = target_net)
 
-env.seed(config['seed'])
-
-playThread = PlayClass(env, actor, memory, agent, sneaky_env, fps = args['fps'])
+# Pass all this information into the thread that will handle the game play and start
+playThread = PlayClass(env, actor, memory, memory_lock, agent, sneaky_env, config)
 playThread.start()
 
-## Logging portion
+# While the play thread is running, we'll periodically log transitions we've encountered
 while playThread.is_alive():
   playThread.join(60) 
   print("Logging....", end = " ")

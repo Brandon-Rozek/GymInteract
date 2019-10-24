@@ -1,41 +1,33 @@
-import gym
+from gym.spaces.box import Box
 import pygame
-import sys
-import time
-import matplotlib
-import rltorch.memory as M
-try:
-    matplotlib.use('GTK3Agg')
-    import matplotlib.pyplot as plt
-except Exception:
-    pass
-
-
-import pyglet.window as pw
-
-from collections import deque
-from pygame.locals import HWSURFACE, DOUBLEBUF, RESIZABLE, VIDEORESIZE
-from threading import Thread, Event, Timer
+from pygame.locals import VIDEORESIZE
+from rltorch.memory import ReplayMemory
 
 class Play:
-    def __init__(self, env, action_selector, memory, agent, sneaky_env, transpose = True, fps = 30, zoom = None, keys_to_action = None):
+    def __init__(self, env, action_selector, memory, memory_lock, agent, sneaky_env, config):
         self.env = env
         self.action_selector = action_selector
-        self.transpose = transpose
-        self.fps = fps
-        self.zoom = zoom
-        self.keys_to_action = None
+        self.memory = memory
+        self.memory_lock = memory_lock
+        self.agent = agent
+        self.sneaky_env = sneaky_env
+        # Get relevant parameters from config or set sane defaults
+        self.transpose = config['transpose'] if 'transpose' in config else True
+        self.fps = config['fps'] if 'fps' in config else 30
+        self.zoom = config['zoom'] if 'zoom' in config else 1
+        self.keys_to_action = config['keys_to_action'] if 'keys_to_action' in config else None
+        self.seconds_play_per_state = config['seconds_play_per_state'] if 'seconds_play_per_state' in config else 30
+        self.num_sneaky_episodes = config['num_sneaky_episodes'] if 'num_sneaky_episodes' in config else 10
+        self.memory_size = config['memory_size'] if 'memory_size' in config else 10**4
+        self.replay_skip = config['replay_skip'] if 'replay_skip' in config else 0
+        # Initial values...
         self.video_size = (0, 0)
         self.pressed_keys = []
         self.screen = None
         self.relevant_keys = set()
         self.running = True
-        self.switch = Event()
         self.state = 0
-        self.paused = False
-        self.memory = memory
-        self.agent = agent
-        self.sneaky_env = sneaky_env
+        self.clock = pygame.time.Clock()
     
     def _display_arr(self, obs, screen, arr, video_size):
         if obs is not None:
@@ -48,6 +40,21 @@ class Play:
             pyg_img = pygame.surfarray.make_surface(arr.swapaxes(0, 1) if self.transpose else arr)
             pyg_img = pygame.transform.scale(pyg_img, video_size)
             screen.blit(pyg_img, (0,0))
+    
+    def _process_common_pygame_events(self, event):
+        if event.type == pygame.QUIT:
+            self.running = False
+        elif event.type == VIDEORESIZE:
+            self.video_size = event.size
+            self.screen = pygame.display.set_mode(self.video_size)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.running = False
+        else:
+            # No event was matched here
+            return False
+        # One of the events above matched
+        return True
+    
 
     def _human_play(self, obs):
         action = self.keys_to_action.get(tuple(sorted(self.pressed_keys)), 0)
@@ -57,20 +64,14 @@ class Play:
 
         # process pygame events
         for event in pygame.event.get():
-            # test events, set key states
-            if event.type == pygame.KEYDOWN:
+            if self._process_common_pygame_events(event):
+                continue
+            elif event.type == pygame.KEYDOWN:
                 if event.key in self.relevant_keys:
                     self.pressed_keys.append(event.key)
-                elif event.key == pygame.K_ESCAPE:
-                    self.running = False
             elif event.type == pygame.KEYUP:
                 if event.key in self.relevant_keys:
                     self.pressed_keys.remove(event.key)
-            elif event.type == pygame.QUIT:
-                self.running = False
-            elif event.type == VIDEORESIZE:
-                self.video_size = event.size
-                self.screen = pygame.display.set_mode(self.video_size)
 
         pygame.display.flip()
         self.clock.tick(self.fps)
@@ -84,13 +85,7 @@ class Play:
 
         # process pygame events
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.running = False
-            elif event.type == VIDEORESIZE:
-                self.video_size = event.size
-                self.screen = pygame.display.set_mode(self.video_size)
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                self.running = False
+            self._process_common_pygame_events(event)
         
         pygame.display.flip()
         self.clock.tick(self.fps)
@@ -107,7 +102,7 @@ class Play:
 
         self.video_size = video_size
         self.screen = pygame.display.set_mode(self.video_size)
-        pygame.font.init() # For later text
+        pygame.font.init()
     
     def _setup_keys(self):
         if self.keys_to_action is None:
@@ -124,48 +119,59 @@ class Play:
         self.state = (self.state + 1) % 5
 
     def pause(self, text = ""):
-        self.paused = True
         myfont = pygame.font.SysFont('Comic Sans MS', 50)
         textsurface = myfont.render(text, False, (0, 0, 0))
         self.screen.blit(textsurface,(0,0))
+
+        # Process pygame events
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.running = False
-            elif event.type == VIDEORESIZE:
-                self.video_size = event.size
-                self.screen = pygame.display.set_mode(self.video_size)
+            if self._process_common_pygame_events(event):
+                continue
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
                     self.pressed_keys.append(event.key)
-                elif event.key == pygame.K_ESCAPE:
-                    self.running = False
             elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
                 self.pressed_keys.remove(event.key)
                 self._increment_state()
-                self.paused = False
+        
         pygame.display.flip()
         self.clock.tick(self.fps)
     
-
     def sneaky_train(self):
+        self.memory_lock.acquire()
+
         # Backup memory
         backup_memory = self.memory
-        self.memory = M.ReplayMemory(capacity = 2000) # Another configurable parameter
-        EPISODES = 30 # Make this configurable
-        replay_skip = 4 # Make this configurable
-        for _ in range(EPISODES):
+        self.memory = ReplayMemory(capacity = self.memory_size)
+
+        # Do a standard RL algorithm process for a certain number of episodes
+        for i in range(self.num_sneaky_episodes):
+            print("Episode: %d / %d, Reward: " % (i + 1, self.num_sneaky_episodes), end = "")
+
+            # Reset all episode releated variables
             prev_obs = self.sneaky_env.reset()
             done = False
             step = 0
+            total_reward = 0
+            
             while not done:
                 action = self.action_selector.act(prev_obs)
                 obs, reward, done, _ = self.sneaky_env.step(action)
+                total_reward += reward
                 self.memory.append(prev_obs, action, reward, obs, done)
                 prev_obs = obs
                 step += 1
-                if step % replay_skip == 0:
+                if step % self.replay_skip == 0:
                     self.agent.learn()
+            
+            # Finish the previous print with the total reward obtained during the episode
+            print(total_reward)
+        
+        # Reset the memory back to the human demonstration / shown computer data 
         self.memory = backup_memory
+        self.memory_lock.release()
+
+        # Thoughts:
         # It would be cool instead of throwing away all this new data, we keep just a sample of it
         # Not sure if i want all of it because then it'll drown out the expert demonstration data
 
@@ -178,54 +184,13 @@ class Play:
         Above code works also if env is wrapped, so it's particularly useful in
         verifying that the frame-level preprocessing does not render the game
         unplayable.
-        If you wish to plot real time statistics as you play, you can use
-        gym.utils.play.PlayPlot. Here's a sample code for plotting the reward
-        for last 5 second of gameplay.
-            def callback(obs_t, obs_tp1, rew, done, info):
-                return [rew,]
-            env_plotter = EnvPlotter(callback, 30 * 5, ["reward"])
-            env = gym.make("Pong-v3")
-            play(env, callback=env_plotter.callback)
-        Arguments
-        ---------
-        env: gym.Env
-            Environment to use for playing.
-        transpose: bool
-            If True the output of observation is transposed.
-            Defaults to true.
-        fps: int
-            Maximum number of steps of the environment to execute every second.
-            Defaults to 30.
-        zoom: float
-            Make screen edge this many times bigger
-        callback: lambda or None
-            Callback if a callback is provided it will be executed after
-            every step. It takes the following input:
-                obs_t: observation before performing action
-                obs_tp1: observation after performing action
-                action: action that was executed
-                rew: reward that was received
-                done: whether the environment is done or not
-                info: debug info
-        keys_to_action: dict: tuple(int) -> int or None
-            Mapping from keys pressed to action performed.
-            For example if pressed 'w' and space at the same time is supposed
-            to trigger action number 2 then key_to_action dict would look like this:
-                {
-                    # ...
-                    sorted(ord('w'), ord(' ')) -> 2
-                    # ...
-                }
-            If None, default key_to_action mapping for that env is used, if provided.
         """
         obs_s = self.env.unwrapped.observation_space
-        assert type(obs_s) == gym.spaces.box.Box
+        assert type(obs_s) == Box
         assert len(obs_s.shape) == 2 or (len(obs_s.shape) == 3 and obs_s.shape[2] in [1,3])
 
         self._setup_keys()
         self._setup_video()
-        
-        self.clock = pygame.time.Clock()
         
         # States
         HUMAN_PLAY = 0
@@ -234,41 +199,61 @@ class Play:
         COMPUTER_PLAY = 3
         TRANSITION2 = 4
         
-
         env_done = True
-        prev_obs = None
         obs = None
-        reward = 0
         i = 0
         while self.running:
+            # If the environment is done after a turn, reset it so we can keep going
             if env_done:
                 obs = self.env.reset()
                 env_done = False
+            
+
             if self.state is HUMAN_PLAY:
-                prev_obs, action, reward, obs, env_done = self._human_play(obs)
+                _, _, _, obs, env_done = self._human_play(obs)
+            
+            # The computer will train for a few episodes without showing to the user.
+            # Mainly to speed up the learning process a bit
             elif self.state is SNEAKY_COMPUTER_PLAY:
+                print("Sneaky Computer Time")
+
+                # Display "Training..." text to user
                 myfont = pygame.font.SysFont('Comic Sans MS', 50)
                 textsurface = myfont.render("Training....", False, (0, 0, 0))
                 self.screen.blit(textsurface,(0,0))
+                pygame.display.flip()
+
+                # Have the agent play a few rounds without showing to the user
                 self.sneaky_train()
+
+                # To take away training text
+                self._display_arr(obs, self.screen, self.env.unwrapped._get_obs(), video_size=self.video_size)
+                pygame.display.flip()
+
+                # Go to the next step immediately
                 self._increment_state()
+            
             elif self.state is TRANSITION:
                 self.pause("Computers Turn! Press <Space> to Start")
+            
             elif self.state is COMPUTER_PLAY:
-                prev_obs, action, reward, obs, env_done = self._computer_play(obs)
+                _, _, _, obs, env_done = self._computer_play(obs)
+            
             elif self.state is TRANSITION2:
                 self.pause("Your Turn! Press <Space> to Start")
 
+            # Increment the timer if it's the human or shown computer's turn
             if self.state is COMPUTER_PLAY or self.state is HUMAN_PLAY:
-                self.memory.append(prev_obs, action, reward, obs, env_done)
                 i += 1
-                # Every 30 seconds...
-                if i % (self.fps * 30) == 0:
-                    print("Training...")
+                # Perform a quick learning process and increment the state after a certain time period has passed
+                if i % (self.fps * self.seconds_play_per_state) == 0:
+                    self.memory_lock.acquire()
+                    print("Number of transitions in buffer: ", len(self.memory))
                     self.agent.learn()
-                    print("PAUSING...")
+                    self.memory_lock.release()
                     self._increment_state()
                     i = 0
-
+        
+        # Stop the pygame environment when done
         pygame.quit()
 
