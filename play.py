@@ -4,13 +4,14 @@ from pygame.locals import VIDEORESIZE
 from rltorch.memory import ReplayMemory
 
 class Play:
-    def __init__(self, env, action_selector, memory, memory_lock, agent, sneaky_env, config):
+    def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config):
         self.env = env
         self.action_selector = action_selector
-        self.memory = memory
-        self.memory_lock = memory_lock
+        self.record_lock = record_lock
+        self.sneaky_agent = sneaky_agent
         self.agent = agent
         self.sneaky_env = sneaky_env
+        self.sneaky_actor = sneaky_actor
         # Get relevant parameters from config or set sane defaults
         self.transpose = config['transpose'] if 'transpose' in config else True
         self.fps = config['fps'] if 'fps' in config else 30
@@ -20,6 +21,7 @@ class Play:
         self.num_sneaky_episodes = config['num_sneaky_episodes'] if 'num_sneaky_episodes' in config else 10
         self.memory_size = config['memory_size'] if 'memory_size' in config else 10**4
         self.replay_skip = config['replay_skip'] if 'replay_skip' in config else 0
+        self.num_train_per_demo = config['num_train_per_demo'] if 'num_train_per_demo' in config else 1
         # Initial values...
         self.video_size = (0, 0)
         self.pressed_keys = []
@@ -28,6 +30,8 @@ class Play:
         self.running = True
         self.state = 0
         self.clock = pygame.time.Clock()
+        self.sneaky_iteration = 0
+        self.paused = False
     
     def _display_arr(self, obs, screen, arr, video_size):
         if obs is not None:
@@ -49,6 +53,9 @@ class Play:
             self.screen = pygame.display.set_mode(self.video_size)
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.running = False
+        elif not self.paused and self.state in [0, 3] and event.type == pygame.KEYUP and event.key == pygame.K_F1:
+            self.paused = True
+            self.display_text("Paused... Press F1 to unpause.")
         else:
             # No event was matched here
             return False
@@ -118,7 +125,7 @@ class Play:
     def _increment_state(self):
         self.state = (self.state + 1) % 5
 
-    def pause(self, text = ""):
+    def transition(self, text = ""):
         myfont = pygame.font.SysFont('Comic Sans MS', 50)
         textsurface = myfont.render(text, False, (0, 0, 0))
         self.screen.blit(textsurface,(0,0))
@@ -138,15 +145,10 @@ class Play:
         self.clock.tick(self.fps)
     
     def sneaky_train(self):
-        self.memory_lock.acquire()
-
-        # Backup memory
-        backup_memory = self.memory
-        self.memory = ReplayMemory(capacity = self.memory_size)
-
+        self.record_lock.acquire()
         # Do a standard RL algorithm process for a certain number of episodes
         for i in range(self.num_sneaky_episodes):
-            print("Episode: %d / %d, Reward: " % (i + 1, self.num_sneaky_episodes), end = "")
+            print("Episode: %d / %d, Reward: " % ((self.num_sneaky_episodes * self.sneaky_iteration) + i + 1, (self.sneaky_iteration + 1) * self.num_sneaky_episodes), end = "")
 
             # Reset all episode releated variables
             prev_obs = self.sneaky_env.reset()
@@ -155,28 +157,40 @@ class Play:
             total_reward = 0
             
             while not done:
-                action = self.action_selector.act(prev_obs)
+                action = self.sneaky_actor.act(prev_obs)
                 obs, reward, done, _ = self.sneaky_env.step(action)
                 total_reward += reward
-                self.memory.append(prev_obs, action, reward, obs, done)
+                self.sneaky_agent.memory.append(prev_obs, action, reward, obs, done)
                 prev_obs = obs
                 step += 1
                 if step % self.replay_skip == 0:
-                    self.agent.learn()
+                    self.sneaky_agent.learn()
             
             # Finish the previous print with the total reward obtained during the episode
             print(total_reward)
-        
-        # Reset the memory back to the human demonstration / shown computer data 
-        self.memory = backup_memory
-        self.memory_lock.release()
-
-        # Thoughts:
-        # It would be cool instead of throwing away all this new data, we keep just a sample of it
-        # Not sure if i want all of it because then it'll drown out the expert demonstration data
-
-        
+        self.sneaky_iteration += 1
+        self.record_lock.release()
     
+    def display_text(self, text):
+        myfont = pygame.font.SysFont('Comic Sans MS', 50)
+        textsurface = myfont.render(text, False, (0, 0, 0))
+        self.screen.blit(textsurface,(0,0))
+        pygame.display.flip()
+    
+    def clear_text(self, obs):
+        self._display_arr(obs, self.screen, self.env.unwrapped._get_obs(), video_size=self.video_size)
+        pygame.display.flip()
+    
+    def process_pause_state(self, obs):
+        # Process game events
+        for event in pygame.event.get():
+            # This rule needs to be before the common one otherwise unpausing is ignored
+            if event.type == pygame.KEYUP and event.key == pygame.K_F1:
+                self.paused = False
+                self.clear_text(obs)
+            else:
+                self._process_common_pygame_events(event)
+
     def start(self):
         """Allows one to play the game using keyboard.
         To simply play the game use:
@@ -200,57 +214,63 @@ class Play:
         TRANSITION2 = 4
         
         env_done = True
+        prev_obs = None
+        action = None
+        reward = None
         obs = None
         i = 0
+        episode_num = 0
         while self.running:
             # If the environment is done after a turn, reset it so we can keep going
             if env_done:
+                episode_num += 1
+                print("Human/Computer Episode: ", episode_num)
                 obs = self.env.reset()
                 env_done = False
             
+            if self.paused:
+                self.process_pause_state(obs)
+                continue
 
             if self.state is HUMAN_PLAY:
-                _, _, _, obs, env_done = self._human_play(obs)
+                prev_obs, action, reward, obs, env_done = self._human_play(obs)
             
             # The computer will train for a few episodes without showing to the user.
             # Mainly to speed up the learning process a bit
             elif self.state is SNEAKY_COMPUTER_PLAY:
                 print("Sneaky Computer Time")
-
-                # Display "Training..." text to user
-                myfont = pygame.font.SysFont('Comic Sans MS', 50)
-                textsurface = myfont.render("Training....", False, (0, 0, 0))
-                self.screen.blit(textsurface,(0,0))
-                pygame.display.flip()
+                self.display_text("Training...")
 
                 # Have the agent play a few rounds without showing to the user
                 self.sneaky_train()
 
-                # To take away training text
-                self._display_arr(obs, self.screen, self.env.unwrapped._get_obs(), video_size=self.video_size)
-                pygame.display.flip()
-
-                # Go to the next step immediately
+                self.clear_text(obs)
                 self._increment_state()
             
             elif self.state is TRANSITION:
-                self.pause("Computers Turn! Press <Space> to Start")
+                self.transition("Computers Turn! Press <Space> to Start")
             
             elif self.state is COMPUTER_PLAY:
-                _, _, _, obs, env_done = self._computer_play(obs)
+                prev_obs, action, reward, obs, env_done = self._computer_play(obs)
             
             elif self.state is TRANSITION2:
-                self.pause("Your Turn! Press <Space> to Start")
+                self.transition("Your Turn! Press <Space> to Start")
 
             # Increment the timer if it's the human or shown computer's turn
             if self.state is COMPUTER_PLAY or self.state is HUMAN_PLAY:
+                self.agent.memory.append(prev_obs, action, reward, obs, env_done)
                 i += 1
                 # Perform a quick learning process and increment the state after a certain time period has passed
                 if i % (self.fps * self.seconds_play_per_state) == 0:
-                    self.memory_lock.acquire()
-                    print("Number of transitions in buffer: ", len(self.memory))
-                    self.agent.learn()
-                    self.memory_lock.release()
+                    self.record_lock.acquire()
+                    self.display_text("Demo Training...")
+                    print("Begin Demonstration Training")
+                    print("Number of transitions in buffer: ", len(self.agent.memory))
+                    for j in range(self.num_train_per_demo):
+                        print("Iteration %d / %d" % (j + 1, self.num_train_per_demo))
+                        self.agent.learn()
+                    self.clear_text(obs)
+                    self.record_lock.release()
                     self._increment_state()
                     i = 0
         

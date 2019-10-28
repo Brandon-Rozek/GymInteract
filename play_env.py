@@ -1,4 +1,7 @@
 
+# TODO: I'm kinda using this project to pilot the whole config/network/example separation
+# The motivation behind this is that the file sizes are getting large and its increasing cognitive load :(
+
 # Import Python Standard Libraries
 from threading import Thread, Lock
 from argparse import ArgumentParser
@@ -10,13 +13,11 @@ from numpy import array as np_array
 from numpy import save as np_save
 import torch
 from torch.optim import Adam
-import torch.nn as nn
-import torch.nn.functional as F
 
 # Import my custom RL library
 import rltorch
-from rltorch.memory import PrioritizedReplayMemory
-from rltorch.action_selector import EpsilonGreedySelector
+from rltorch.memory import PrioritizedReplayMemory, ReplayMemory
+from rltorch.action_selector import EpsilonGreedySelector, ArgMaxSelector
 import rltorch.env as E
 import rltorch.network as rn
 
@@ -28,73 +29,24 @@ import play
 
 
 #
-## Networks
+## Networks (Probably want to move this to config file)
 #
-class Value(nn.Module):
-  def __init__(self, state_size, action_size):
-    super(Value, self).__init__()
-    self.state_size = state_size
-    self.action_size = action_size
-    
-    self.conv1 = nn.Conv2d(4, 32, kernel_size = (8, 8), stride = (4, 4))
-    self.conv2 = nn.Conv2d(32, 64, kernel_size = (4, 4), stride = (2, 2))    
-    self.conv3 = nn.Conv2d(64, 64, kernel_size = (3, 3), stride = (1, 1))
-    
-    self.fc1 = nn.Linear(3136, 512)
-    self.fc1_norm = nn.LayerNorm(512)
-
-    self.value_fc = rn.NoisyLinear(512, 512)
-    self.value_fc_norm = nn.LayerNorm(512)
-    self.value = nn.Linear(512, 1)
-    
-    self.advantage_fc = rn.NoisyLinear(512, 512)
-    self.advantage_fc_norm = nn.LayerNorm(512)
-    self.advantage = nn.Linear(512, action_size)
-
-  
-  def forward(self, x):
-    x = x.float() / 256
-    x = F.relu(self.conv1(x))
-    x = F.relu(self.conv2(x))
-    x = F.relu(self.conv3(x))
-    
-    # Makes batch_size dimension again
-    x = x.view(-1, 3136)
-    x = F.relu(self.fc1_norm(self.fc1(x)))
-    
-    state_value = F.relu(self.value_fc_norm(self.value_fc(x)))
-    state_value = self.value(state_value)
-    
-    advantage = F.relu(self.advantage_fc_norm(self.advantage_fc(x)))
-    advantage = self.advantage(advantage)
-    
-    x = state_value + advantage - advantage.mean()
-    
-    # For debugging purposes...
-    if torch.isnan(x).any().item():
-      print("WARNING NAN IN MODEL DETECTED")
-    
-    return x
-
+from networks import Value
 
 #
 ## Play Related Classes
 #
-Transition = namedtuple('Transition',
-      ('state', 'action', 'reward', 'next_state', 'done'))
-
 class PlayClass(Thread):
-  def __init__(self, env, action_selector, memory, memory_lock, agent, sneaky_env, config):
+  def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config):
     super(PlayClass, self).__init__()
-    self.play = play.Play(env, action_selector, memory, memory_lock, agent, sneaky_env, config)
+    self.play = play.Play(env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock,  config)
 
   def run(self):
     self.play.start()
 
 class Record(GymWrapper):
-  def __init__(self, env, memory, memory_lock, args):
+  def __init__(self, env, memory, args):
     GymWrapper.__init__(self, env)
-    self.memory_lock = memory_lock
     self.memory = memory
     self.skipframes = args['skip']
     self.environment_name = args['environment_name']
@@ -110,14 +62,11 @@ class Record(GymWrapper):
     self.current_i += 1
     # Don't add to memory until a certain number of frames is reached
     if self.current_i % self.skipframes == 0:
-      self.memory_lock.acquire()
-      self.memory.append(state, action, reward, next_state, done)
-      self.memory_lock.release()
+      self.memory.append((state, action, reward, next_state, done))
       self.current_i = 0
     return next_state, reward, done, info
   
   def log_transitions(self):
-    self.memory_lock.acquire()
     if len(self.memory) > 0:
       basename = self.logdir + "/{}.{}".format(self.environment_name, datetime.now().strftime("%Y-%m-%d-%H-%M-%s"))
       print("Base Filename: ", basename)
@@ -128,7 +77,6 @@ class Record(GymWrapper):
       np_save(basename + "-nextstate.npy", np_array(next_state), allow_pickle = False)
       np_save(basename + "-done.npy", np_array(done), allow_pickle = False)
       self.memory.clear()
-    self.memory_lock.release()
 
 
 ## Parsing arguments
@@ -141,31 +89,8 @@ parser.add_argument("--model", type=str, help = "The path location of the PyTorc
 args = vars(parser.parse_args())
 
 ## Main configuration for script
-config = {}
-config['seed'] = 901
-config['seconds_play_per_state'] = 60
-config['zoom'] = 4
-config['environment_name'] = 'PongNoFrameskip-v4'
-config['learning_rate'] = 1e-4
-config['target_sync_tau'] = 1e-3
-config['discount_rate'] = 0.99
-config['exploration_rate'] = rltorch.scheduler.ExponentialScheduler(initial_value = 1, end_value = 0.1, iterations = 10**5)
-# Number of episodes for the computer to train the agent without the human seeing
-config['num_sneaky_episodes'] = 20
-config['replay_skip'] = 14
-config['batch_size'] = 32 * (config['replay_skip'] + 1)
-config['disable_cuda'] = False
-config['memory_size'] = 10**4
-# Prioritized vs Random Sampling
-# 0 - Random sampling
-# 1 - Only the highest prioirities
-config['prioritized_replay_sampling_priority'] = 0.6
-# How important are the weights for the loss?
-# 0 - Treat all losses equally
-# 1 - Lower the importance of high losses
-# Should ideally start from 0 and move your way to 1 to prevent overfitting
-config['prioritized_replay_weight_importance'] = rltorch.scheduler.ExponentialScheduler(initial_value = 0.4, end_value = 1, iterations = 10**5)
-
+from config import config
+from sneaky_config import sneaky_config
 
 # Environment name and log directory is vital so show help message and exit if not provided
 if args['environment_name'] is None or args['logdir'] is None:
@@ -175,7 +100,7 @@ if args['environment_name'] is None or args['logdir'] is None:
 # Number of frames to skip when recording and fps can have sane defaults
 if args['skip'] is None:
   args['skip'] = 3
-if args['fps'] is None:
+if 'fps' not in args:
   args['fps'] = 30
 
 
@@ -196,21 +121,19 @@ def wrap_preprocessing(env, MaxAndSkipEnv = False):
     , 4)
   )
 
-
 ## Set up environment to be recorded and preprocessed
-memory = PrioritizedReplayMemory(capacity = config['memory_size'], alpha = config['prioritized_replay_sampling_priority'])
-memory_lock = Lock()
-env = Record(makeEnv(args['environment_name']), memory, memory_lock, args)
+record_memory = []
+record_lock = Lock()
+env = Record(makeEnv(args['environment_name']), record_memory, args)
+
 # Bind record_env to current env so that we can reference log_transitions easier later
 record_env = env
+
 # Use native gym  monitor to get video recording
 env = GymMonitor(env, args['logdir'], force=True)
+
 # Preprocess enviornment
 env = wrap_preprocessing(env)
-
-# Use a different environment for when the computer trains on the side so that the current game state isn't manipuated
-# Also use MaxEnvSkip to speed up processing
-sneaky_env = wrap_preprocessing(makeEnv(args['environment_name']), MaxAndSkipEnv = True)
 
 # Set seeds
 rltorch.set_seed(config['seed'])
@@ -226,18 +149,31 @@ net = rn.Network(Value(state_size, action_size),
 target_net = rn.TargetNetwork(net, device = device)
 
 # Relevant components from RLTorch
-actor = EpsilonGreedySelector(net, action_size, device = device, epsilon = config['exploration_rate'])
+memory = PrioritizedReplayMemory(capacity = config['memory_size'], alpha = config['prioritized_replay_sampling_priority'])
+actor = ArgMaxSelector(net, action_size, device = device)
 agent = rltorch.agents.DQNAgent(net, memory, config, target_net = target_net)
 
+# Use a different environment for when the computer trains on the side so that the current game state isn't manipuated
+# Also use MaxEnvSkip to speed up processing
+sneaky_env = wrap_preprocessing(makeEnv(args['environment_name']), MaxAndSkipEnv = True)
+sneaky_memory = ReplayMemory(capacity = sneaky_config['memory_size'])
+sneaky_actor = EpsilonGreedySelector(net, action_size, device = device, epsilon = sneaky_config['exploration_rate'])
+
+sneaky_agent = rltorch.agents.DQNAgent(net, sneaky_memory, sneaky_config, target_net = target_net)
+
 # Pass all this information into the thread that will handle the game play and start
-playThread = PlayClass(env, actor, memory, memory_lock, agent, sneaky_env, config)
+playThread = PlayClass(env, actor, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config)
 playThread.start()
 
 # While the play thread is running, we'll periodically log transitions we've encountered
 while playThread.is_alive():
   playThread.join(60) 
+  record_lock.acquire()
   print("Logging....", end = " ")
   record_env.log_transitions()
+  record_lock.release()
 
 # Save what's remaining after process died
+record_lock.acquire()
 record_env.log_transitions()
+record_lock.release()
