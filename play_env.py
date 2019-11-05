@@ -37,17 +37,18 @@ from networks import Value
 ## Play Related Classes
 #
 class PlayClass(Thread):
-  def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config):
+  def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config):
     super(PlayClass, self).__init__()
-    self.play = play.Play(env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock,  config)
+    self.play = play.Play(env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config)
 
   def run(self):
     self.play.start()
 
 class Record(GymWrapper):
-  def __init__(self, env, memory, args):
+  def __init__(self, env, memory, lock, args):
     GymWrapper.__init__(self, env)
     self.memory = memory
+    self.lock = lock # Lock for memory access
     self.skipframes = args['skip']
     self.environment_name = args['environment_name']
     self.logdir = args['logdir']
@@ -62,14 +63,16 @@ class Record(GymWrapper):
     self.current_i += 1
     # Don't add to memory until a certain number of frames is reached
     if self.current_i % self.skipframes == 0:
+      self.lock.acquire()
       self.memory.append((state, action, reward, next_state, done))
+      self.lock.release()
       self.current_i = 0
     return next_state, reward, done, info
   
   def log_transitions(self):
     if len(self.memory) > 0:
       basename = self.logdir + "/{}.{}".format(self.environment_name, datetime.now().strftime("%Y-%m-%d-%H-%M-%s"))
-      print("Base Filename: ", basename)
+      print("Base Filename: ", basename, flush = True)
       state, action, reward, next_state, done = zip(*self.memory)
       np_save(basename + "-state.npy", np_array(state), allow_pickle = False)
       np_save(basename + "-action.npy", np_array(action), allow_pickle = False)
@@ -124,7 +127,7 @@ def wrap_preprocessing(env, MaxAndSkipEnv = False):
 ## Set up environment to be recorded and preprocessed
 record_memory = []
 record_lock = Lock()
-env = Record(makeEnv(args['environment_name']), record_memory, args)
+env = Record(makeEnv(args['environment_name']), record_memory, record_lock, args)
 
 # Bind record_env to current env so that we can reference log_transitions easier later
 record_env = env
@@ -162,7 +165,7 @@ sneaky_actor = EpsilonGreedySelector(net, action_size, device = device, epsilon 
 sneaky_agent = rltorch.agents.DQNAgent(net, sneaky_memory, sneaky_config, target_net = target_net)
 
 # Pass all this information into the thread that will handle the game play and start
-playThread = PlayClass(env, actor, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config)
+playThread = PlayClass(env, actor, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config)
 playThread.start()
 
 # While the play thread is running, we'll periodically log transitions we've encountered
