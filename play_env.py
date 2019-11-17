@@ -152,9 +152,9 @@ net = rn.Network(Value(state_size, action_size),
 target_net = rn.TargetNetwork(net, device = device)
 
 # Relevant components from RLTorch
-memory = PrioritizedReplayMemory(capacity = config['memory_size'], alpha = config['prioritized_replay_sampling_priority'])
+memory =  M.DQfDMemory(capacity= config['memory_size'], alpha = config['prioritized_replay_sampling_priority'], max_demo = config['memory_size'] // 2)
 actor = ArgMaxSelector(net, action_size, device = device)
-agent = rltorch.agents.DQNAgent(net, memory, config, target_net = target_net)
+agent = rltorch.agents.DQfDAgent(net, memory, config, target_net = target_net)
 
 # Use a different environment for when the computer trains on the side so that the current game state isn't manipuated
 # Also use MaxEnvSkip to speed up processing
