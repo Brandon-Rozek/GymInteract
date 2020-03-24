@@ -1,15 +1,16 @@
 from gym.spaces.box import Box
 import pygame
 from pygame.locals import VIDEORESIZE
+import rltorch
 from rltorch.memory import ReplayMemory
 
 class Play:
-    def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config):
+    def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, record_lock, config):
         self.env = env
         self.action_selector = action_selector
         self.record_lock = record_lock
         self.record_locked = False
-        self.sneaky_agent = sneaky_agent
+        #self.sneaky_agent = sneaky_agent
         self.agent = agent
         self.sneaky_env = sneaky_env
         self.sneaky_actor = sneaky_actor
@@ -19,8 +20,8 @@ class Play:
         self.zoom = config['zoom'] if 'zoom' in config else 1
         self.keys_to_action = config['keys_to_action'] if 'keys_to_action' in config else None
         self.seconds_play_per_state = config['seconds_play_per_state'] if 'seconds_play_per_state' in config else 30
-        self.num_sneaky_episodes = sneaky_config['num_sneaky_episodes'] if 'num_sneaky_episodes' in sneaky_config else 10
-        self.replay_skip = sneaky_config['replay_skip'] if 'replay_skip' in sneaky_config else 0
+        self.num_sneaky_episodes = config['num_sneaky_episodes'] if 'num_sneaky_episodes' in config else 10
+        self.replay_skip = config['replay_skip'] if 'replay_skip' in config else 0
         self.num_train_per_demo = config['num_train_per_demo'] if 'num_train_per_demo' in config else 1
         # Initial values...
         self.video_size = (0, 0)
@@ -32,6 +33,7 @@ class Play:
         self.clock = pygame.time.Clock()
         self.sneaky_iteration = 0
         self.paused = False
+        self.space_pressed = False
     
     def _display_arr(self, obs, screen, arr, video_size):
         if obs is not None:
@@ -135,42 +137,39 @@ class Play:
         for event in pygame.event.get():
             if self._process_common_pygame_events(event):
                 continue
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    self.pressed_keys.append(event.key)
-            elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
-                self.pressed_keys.remove(event.key)
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                self.space_pressed = True
+            elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and self.space_pressed:
+                self.space_pressed = False
                 self._increment_state()
         
         pygame.display.flip()
         self.clock.tick(self.fps)
     
     def sneaky_train(self):
-        # self.record_lock.acquire()
         # Do a standard RL algorithm process for a certain number of episodes
+        step = 0
         for i in range(self.num_sneaky_episodes):
             print("Episode: %d / %d, Reward: " % ((self.num_sneaky_episodes * self.sneaky_iteration) + i + 1, (self.sneaky_iteration + 1) * self.num_sneaky_episodes), end = "")
 
             # Reset all episode related variables
             prev_obs = self.sneaky_env.reset()
             done = False
-            step = 0
             total_reward = 0
             
             while not done:
                 action = self.sneaky_actor.act(prev_obs)
                 obs, reward, done, _ = self.sneaky_env.step(action)
                 total_reward += reward
-                self.sneaky_agent.memory.append(prev_obs, action, reward, obs, done)
+                self.agent.memory.append(prev_obs, action, reward, obs, done)
                 prev_obs = obs
                 step += 1
                 if step % self.replay_skip == 0:
-                    self.sneaky_agent.learn()
+                    self.agent.learn()
             
             # Finish the previous print with the total reward obtained during the episode
-            print(total_reward, flush = True)
+            print(total_reward, "Epsilon:", next(self.sneaky_actor.epsilon), flush = True)
         self.sneaky_iteration += 1
-        # self.record_lock.release()
     
     def display_text(self, text):
         myfont = pygame.font.SysFont('Comic Sans MS', 50)
@@ -247,7 +246,9 @@ class Play:
             
             # The computer will train for a few episodes without showing to the user.
             # Mainly to speed up the learning process a bit
-            elif self.state is SNEAKY_COMPUTER_PLAY:
+            elif self.state == SNEAKY_COMPUTER_PLAY:
+                # Clear pressed keys in case a key is left inside (the bug where you can't control it since it just holds a button)
+                self.pressed_keys.clear()
                 if not self.record_locked:
                     self.record_lock.acquire()
                     self.record_locked = True
@@ -277,25 +278,18 @@ class Play:
                     self.record_lock.acquire()
                     self.record_locked = True
                 self.transition("Your Turn! Press <Space> to Start")
-
+            
+            
             # Increment the timer if it's the human or shown computer's turn
             if self.state is COMPUTER_PLAY or self.state is HUMAN_PLAY:
-                if self.state == HUMAN_PLAY and isinstance(self.agent.memory, 'DQfDMemory'):
+                if self.state == HUMAN_PLAY and (isinstance(self.agent.memory, rltorch.memory.DQfDMemory) or isinstance(self.agent.memory, rltorch.memory.iDQfDMemory)):
                     self.agent.memory.append_demonstration(prev_obs, action, reward, obs, env_done)
                 else:
                     self.agent.memory.append(prev_obs, action, reward, obs, env_done)
                 i += 1
                 # Perform a quick learning process and increment the state after a certain time period has passed
                 if i % (self.fps * self.seconds_play_per_state) == 0:
-                    self.record_lock.acquire()
-                    self.display_text("Demo Training...")
-                    print("Begin Demonstration Training")
                     print("Number of transitions in buffer: ", len(self.agent.memory), flush = True)
-                    for j in range(self.num_train_per_demo):
-                        print("Iteration %d / %d" % (j + 1, self.num_train_per_demo))
-                        self.agent.learn()
-                    self.clear_text(obs)
-                    self.record_lock.release()
                     self._increment_state()
                     i = 0
         

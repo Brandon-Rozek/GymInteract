@@ -16,7 +16,7 @@ from torch.optim import Adam
 
 # Import my custom RL library
 import rltorch
-from rltorch.memory import PrioritizedReplayMemory, ReplayMemory, DQfDMemory
+from rltorch.memory import PrioritizedReplayMemory, ReplayMemory, iDQfDMemory
 from rltorch.action_selector import EpsilonGreedySelector, ArgMaxSelector
 import rltorch.env as E
 import rltorch.network as rn
@@ -37,9 +37,9 @@ from networks import Value
 ## Play Related Classes
 #
 class PlayClass(Thread):
-  def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config):
+  def __init__(self, env, action_selector, agent, sneaky_env, sneaky_actor, record_lock, config):
     super(PlayClass, self).__init__()
-    self.play = play.Play(env, action_selector, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config)
+    self.play = play.Play(env, action_selector, agent, sneaky_env, sneaky_actor, record_lock, config)
 
   def run(self):
     self.play.start()
@@ -93,7 +93,6 @@ args = vars(parser.parse_args())
 
 ## Main configuration for script
 from config import config
-from sneaky_config import sneaky_config
 
 # Environment name and log directory is vital so show help message and exit if not provided
 if args['environment_name'] is None or args['logdir'] is None:
@@ -152,20 +151,18 @@ net = rn.Network(Value(state_size, action_size),
 target_net = rn.TargetNetwork(net, device = device)
 
 # Relevant components from RLTorch
-memory =  DQfDMemory(capacity= config['memory_size'], alpha = config['prioritized_replay_sampling_priority'], max_demo = config['memory_size'] // 2)
+memory =  iDQfDMemory(capacity= config['memory_size'], max_demo = config['memory_size'] // 10)
 actor = ArgMaxSelector(net, action_size, device = device)
 agent = rltorch.agents.DQfDAgent(net, memory, config, target_net = target_net)
 
 # Use a different environment for when the computer trains on the side so that the current game state isn't manipuated
 # Also use MaxEnvSkip to speed up processing
 sneaky_env = wrap_preprocessing(makeEnv(args['environment_name']), MaxAndSkipEnv = True)
-sneaky_memory = ReplayMemory(capacity = sneaky_config['memory_size'])
-sneaky_actor = EpsilonGreedySelector(net, action_size, device = device, epsilon = sneaky_config['exploration_rate'])
+sneaky_actor = EpsilonGreedySelector(net, action_size, device = device, epsilon = config['exploration_rate'])
 
-sneaky_agent = rltorch.agents.DQNAgent(net, sneaky_memory, sneaky_config, target_net = target_net)
 
 # Pass all this information into the thread that will handle the game play and start
-playThread = PlayClass(env, actor, agent, sneaky_env, sneaky_actor, sneaky_agent, record_lock, config, sneaky_config)
+playThread = PlayClass(env, actor, agent, sneaky_env, sneaky_actor, record_lock, config)
 playThread.start()
 
 # While the play thread is running, we'll periodically log transitions we've encountered
